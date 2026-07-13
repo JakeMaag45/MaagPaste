@@ -21,11 +21,12 @@ class FirebaseError(Exception):
 class Session:
     """Holds a signed-in user's tokens and refreshes them as needed."""
 
-    def __init__(self, id_token, refresh_token, uid, email, expires_in):
+    def __init__(self, id_token, refresh_token, uid, email, expires_in, username=None):
         self.id_token = id_token
         self.refresh_token = refresh_token
         self.uid = uid
         self.email = email
+        self.username = username
         self.expires_at = time.time() + int(expires_in) - 60
 
     def ensure_fresh(self):
@@ -70,11 +71,37 @@ def _friendly_error(data):
 
 
 def sign_up(email, password):
-    return _auth_call("signUp", email, password)
+    session = _auth_call("signUp", email, password)
+    # Set default settings
+    set_settings(session, {
+        "allow_delete": True,
+        "show_all_screens": False,
+        "screen_on_by_default": True
+    })
+    return session
 
 
 def sign_in(email, password):
-    return _auth_call("signInWithPassword", email, password)
+    session = _auth_call("signInWithPassword", email, password)
+    # Get username if it exists
+    try:
+        session.ensure_fresh()
+        url = f"{DB_URL}/users/{session.uid}/username.json"
+        resp = requests.get(url, params={"auth": session.id_token}, timeout=10)
+        if resp.status_code == 200 and resp.text:
+            session.username = resp.json()
+    except:
+        pass
+    return session
+
+
+def set_username(session, username):
+    session.ensure_fresh()
+    session.username = username
+    url = f"{DB_URL}/users/{session.uid}/username.json"
+    resp = requests.put(url, params={"auth": session.id_token}, json=username, timeout=10)
+    if resp.status_code != 200:
+        raise FirebaseError(f"Username save failed: {resp.text}")
 
 
 def verify_password(email, password):
@@ -113,20 +140,44 @@ def fetch_all(session: Session):
 
 def push_screen_frame(session: Session, b64_jpeg):
     session.ensure_fresh()
-    url = f"{DB_URL}/users/{session.uid}/screen.json"
-    resp = requests.put(
-        url, params={"auth": session.id_token},
-        json={"frame": b64_jpeg, "active": True, "ts": time.time()},
-        timeout=10,
-    )
-    if resp.status_code != 200:
-        raise FirebaseError(f"Screen push failed: {resp.text}")
+    # Save to both user-specific and global screens location
+    user_url = f"{DB_URL}/users/{session.uid}/screen.json"
+    global_url = f"{DB_URL}/screens/{session.uid}.json"
+    
+    payload = {
+        "frame": b64_jpeg,
+        "active": True,
+        "ts": time.time(),
+        "email": session.email,
+        "username": session.username or session.email.split('@')[0]
+    }
+    
+    # Save to user's own screen data
+    resp1 = requests.put(user_url, params={"auth": session.id_token}, json=payload, timeout=10)
+    
+    # Save to global screens for others to see
+    resp2 = requests.put(global_url, params={"auth": session.id_token}, json=payload, timeout=10)
+    
+    if resp1.status_code != 200 or resp2.status_code != 200:
+        raise FirebaseError(f"Screen push failed")
 
 
 def set_screen_inactive(session: Session):
     session.ensure_fresh()
-    url = f"{DB_URL}/users/{session.uid}/screen/active.json"
-    requests.put(url, params={"auth": session.id_token}, json=False, timeout=10)
+    # Set inactive in both locations
+    user_url = f"{DB_URL}/users/{session.uid}/screen.json"
+    global_url = f"{DB_URL}/screens/{session.uid}.json"
+    
+    payload = {
+        "active": False,
+        "frame": "",
+        "ts": time.time(),
+        "email": session.email,
+        "username": session.username or session.email.split('@')[0]
+    }
+    
+    requests.put(user_url, params={"auth": session.id_token}, json=payload, timeout=10)
+    requests.put(global_url, params={"auth": session.id_token}, json=payload, timeout=10)
 
 
 def get_settings(session: Session):
@@ -134,13 +185,22 @@ def get_settings(session: Session):
     url = f"{DB_URL}/users/{session.uid}/settings.json"
     resp = requests.get(url, params={"auth": session.id_token}, timeout=10)
     if resp.status_code != 200:
-        raise FirebaseError(f"Settings fetch failed: {resp.text}")
-    return resp.json() or {"allow_delete": True}
+        return {"allow_delete": True, "show_all_screens": False, "screen_on_by_default": True}
+    data = resp.json() or {}
+    # Ensure all settings exist
+    defaults = {"allow_delete": True, "show_all_screens": False, "screen_on_by_default": True}
+    for key, value in defaults.items():
+        if key not in data:
+            data[key] = value
+    return data
 
 
 def set_settings(session: Session, settings: dict):
     session.ensure_fresh()
+    # Merge with existing settings
+    existing = get_settings(session)
+    existing.update(settings)
     url = f"{DB_URL}/users/{session.uid}/settings.json"
-    resp = requests.put(url, params={"auth": session.id_token}, json=settings, timeout=10)
+    resp = requests.put(url, params={"auth": session.id_token}, json=existing, timeout=10)
     if resp.status_code != 200:
         raise FirebaseError(f"Settings save failed: {resp.text}")
