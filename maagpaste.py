@@ -11,6 +11,8 @@ Author: built for Jake
 
 import os
 import sys
+import io
+import base64
 import time
 import sqlite3
 import threading
@@ -20,7 +22,7 @@ import customtkinter as ctk
 import pyperclip
 import pystray
 import keyboard
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageGrab
 
 import firebase_client as fb
 
@@ -399,6 +401,7 @@ class MaagPasteApp:
         self.db = Database(DB_PATH)
         self.allow_delete = True
         self._syncing_ids = set()
+        self.sharing = False
 
         self.root = ctk.CTk()
         self.root.title("MaagPaste")
@@ -413,6 +416,7 @@ class MaagPasteApp:
 
         self.watcher = ClipboardWatcher(self._on_new_copy)
         self.watcher.start()
+        threading.Thread(target=self._share_loop, daemon=True).start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.tray_icon = None
@@ -443,12 +447,25 @@ class MaagPasteApp:
                                   command=self.open_settings)
         gear_btn.pack(side="right")
 
+        self.share_btn = ctk.CTkButton(header, text="🖥", width=32, height=28, corner_radius=8,
+                                        fg_color="transparent", border_width=1, border_color="#3a3a3a",
+                                        hover_color=CARD_HOVER, font=ctk.CTkFont(size=13),
+                                        command=self.toggle_sharing)
+        self.share_btn.pack(side="right", padx=(0, 6))
+
+        self.share_banner = ctk.CTkLabel(
+            self.root, text="🔴  Screen sharing is ON — visible on your website  ·  click 🖥 to stop",
+            fg_color="#4a1f1f", text_color="#ff9d9d", corner_radius=8,
+            font=ctk.CTkFont(size=11, weight="bold"), height=30,
+        )
+        # not packed until sharing starts
+
         self.search_var = ctk.StringVar()
         self.search_var.trace_add("write", lambda *a: self.refresh())
-        search_entry = ctk.CTkEntry(self.root, textvariable=self.search_var,
+        self.search_entry = ctk.CTkEntry(self.root, textvariable=self.search_var,
                                      placeholder_text="Search clipboard history…", height=36,
                                      corner_radius=10, fg_color=CARD_DARK, border_width=0)
-        search_entry.pack(fill="x", padx=16, pady=(0, 10))
+        self.search_entry.pack(fill="x", padx=16, pady=(0, 10))
 
         self.scroll = ctk.CTkScrollableFrame(self.root, fg_color="transparent",
                                               scrollbar_button_color="#3a3a3a",
@@ -458,6 +475,40 @@ class MaagPasteApp:
         self.status_label = ctk.CTkLabel(self.root, text=f"Signed in as {self.session.email}",
                                           text_color=TEXT_MUTED, font=ctk.CTkFont(size=10))
         self.status_label.pack(pady=(0, 8))
+
+    # -- screen sharing (explicit opt-in only, always visibly on) ----------
+
+    def toggle_sharing(self):
+        self.sharing = not self.sharing
+        if self.sharing:
+            self.share_btn.configure(fg_color="#4a1f1f", text_color="#ff9d9d")
+            self.share_banner.pack(fill="x", padx=16, pady=(0, 8), before=self.search_entry)
+            self._toast("Screen sharing turned ON.")
+        else:
+            self.share_btn.configure(fg_color="transparent", text_color=("#000", "#fff"))
+            self.share_banner.pack_forget()
+            threading.Thread(target=lambda: self._safe(fb.set_screen_inactive, self.session), daemon=True).start()
+            self._toast("Screen sharing turned off.")
+
+    def _share_loop(self):
+        while True:
+            if self.sharing:
+                try:
+                    frame = self._capture_frame()
+                    if frame:
+                        fb.push_screen_frame(self.session, frame)
+                except Exception:
+                    pass
+                time.sleep(2)
+            else:
+                time.sleep(0.5)
+
+    def _capture_frame(self):
+        img = ImageGrab.grab()
+        img.thumbnail((960, 960))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=45)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
     # -- remote settings ----------------------------------------------------
 
@@ -620,6 +671,8 @@ class MaagPasteApp:
             self.hide_window()
 
     def logout(self):
+        self.sharing = False
+        self._safe(fb.set_screen_inactive, self.session)
         self.watcher.stop()
         if self.tray_icon:
             self.tray_icon.stop()
@@ -656,6 +709,8 @@ class MaagPasteApp:
             pass
 
     def _quit(self):
+        self.sharing = False
+        self._safe(fb.set_screen_inactive, self.session)
         self.watcher.stop()
         if self.tray_icon:
             self.tray_icon.stop()
