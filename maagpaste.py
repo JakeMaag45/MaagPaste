@@ -1,193 +1,838 @@
 """
-Firebase client for MaagPaste - handles authentication and real-time database operations.
+MaagPaste - A Windows 11 styled clipboard history manager with account sync.
+
+Sign in, and every copy you make syncs live to your account and shows up
+on the MaagPaste website in real time too. Logging out is always just one
+click - no password needed. Your password is only ever asked for again to
+open Settings, where you control whether deleting history is even allowed.
+
+Screen sharing is ON by default and requires password to turn off.
 """
 
-import requests
-import json
+import os
+import sys
+import io
+import base64
 import time
-from datetime import datetime
+import sqlite3
+import threading
+from datetime import datetime, timedelta
 
-class FirebaseError(Exception):
-    pass
+# Try to import dependencies with error handling
+try:
+    import customtkinter as ctk
+except ImportError:
+    print("Error: customtkinter not installed. Run: pip install customtkinter")
+    sys.exit(1)
 
-class Session:
-    def __init__(self, id_token, refresh_token, local_id, email, username=None):
-        self.id_token = id_token
-        self.refresh_token = refresh_token
-        self.local_id = local_id
-        self.email = email
-        self.username = username
-        self._expires_at = time.time() + 3600  # tokens expire in 1 hour
+try:
+    import pyperclip
+except ImportError:
+    print("Error: pyperclip not installed. Run: pip install pyperclip")
+    sys.exit(1)
 
-    def refresh_if_needed(self):
-        if time.time() > self._expires_at:
-            refresh_id_token(self)
-            self._expires_at = time.time() + 3600
+try:
+    import pystray
+except ImportError:
+    print("Error: pystray not installed. Run: pip install pystray")
+    sys.exit(1)
 
-def refresh_id_token(session):
-    """Refresh the Firebase ID token using the refresh token."""
-    url = "https://securetoken.googleapis.com/v1/token?key=AIzaSyCnDgLCSegRmRF4cDYMEkTVAfIQUrm9XWE"
-    payload = {
-        "grant_type": "refresh_token",
-        "refresh_token": session.refresh_token
-    }
-    response = requests.post(url, data=payload)
-    if response.status_code != 200:
-        raise FirebaseError("Failed to refresh token")
-    data = response.json()
-    session.id_token = data["id_token"]
-    session.refresh_token = data.get("refresh_token", session.refresh_token)
+try:
+    import keyboard
+except ImportError:
+    print("Error: keyboard not installed. Run: pip install keyboard")
+    sys.exit(1)
 
-def sign_in(email, password):
-    url = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyCnDgLCSegRmRF4cDYMEkTVAfIQUrm9XWE"
-    payload = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }
-    response = requests.post(url, json=payload)
-    if response.status_code != 200:
-        error = response.json().get("error", {})
-        raise FirebaseError(error.get("message", "Sign in failed"))
-    data = response.json()
-    
-    # Get username from database
-    username = get_username(data["localId"], data["idToken"])
-    
-    return Session(
-        id_token=data["idToken"],
-        refresh_token=data["refreshToken"],
-        local_id=data["localId"],
-        email=data["email"],
-        username=username
-    )
+try:
+    from PIL import Image, ImageDraw, ImageGrab
+except ImportError:
+    print("Error: Pillow not installed. Run: pip install Pillow")
+    sys.exit(1)
 
-def sign_up(email, password, username):
-    url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=AIzaSyCnDgLCSegRmRF4cDYMEkTVAfIQUrm9XWE"
-    payload = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }
-    response = requests.post(url, json=payload)
-    if response.status_code != 200:
-        error = response.json().get("error", {})
-        raise FirebaseError(error.get("message", "Sign up failed"))
-    data = response.json()
-    
-    # Save username to database
-    set_username(data["localId"], data["idToken"], username)
-    
-    # Set default settings - screen sharing ON by default
-    set_settings(data["localId"], data["idToken"], {
-        "allow_delete": True,
-        "show_all_screens": False,
-        "screen_on_by_default": True
-    })
-    
-    return Session(
-        id_token=data["idToken"],
-        refresh_token=data["refreshToken"],
-        local_id=data["localId"],
-        email=data["email"],
-        username=username
-    )
+import firebase_client as fb
 
-def get_username(local_id, id_token):
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/users/{local_id}/username.json?auth={id_token}"
-    response = requests.get(url)
-    if response.status_code == 200 and response.text:
-        return response.json()
-    return None
+APP_NAME = "MaagPaste"
+ACCENT = "#0078D4"
+BG_DARK = "#202020"
+CARD_DARK = "#2b2b2b"
+CARD_HOVER = "#333333"
+TEXT_MUTED = "#9a9a9a"
+ERROR_RED = "#e06c6c"
 
-def set_username(local_id, id_token, username):
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/users/{local_id}/username.json?auth={id_token}"
-    response = requests.put(url, json=username)
-    if response.status_code != 200:
-        raise FirebaseError("Failed to save username")
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
-def verify_password(email, password):
-    """Verify the user's password without signing in."""
-    url = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyCnDgLCSegRmRF4cDYMEkTVAfIQUrm9XWE"
-    payload = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }
-    response = requests.post(url, json=payload)
-    if response.status_code != 200:
-        raise FirebaseError("Incorrect password")
 
-def push_entry(session, entry_id, content, created_at):
-    session.refresh_if_needed()
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/users/{session.local_id}/history/{entry_id}.json?auth={session.id_token}"
-    payload = {
-        "content": content,
-        "created_at": created_at
-    }
-    response = requests.put(url, json=payload)
-    if response.status_code != 200:
-        raise FirebaseError("Failed to push entry")
+def app_data_dir():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, APP_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
 
-def fetch_all(session):
-    session.refresh_if_needed()
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/users/{session.local_id}/history.json?auth={session.id_token}"
-    response = requests.get(url)
-    if response.status_code != 200:
-        return {}
-    return response.json() or {}
 
-def delete_entry(session, entry_id):
-    session.refresh_if_needed()
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/users/{session.local_id}/history/{entry_id}.json?auth={session.id_token}"
-    response = requests.delete(url)
-    return response.status_code == 200
+DB_PATH = os.path.join(app_data_dir(), "history.db")
 
-def get_settings(session):
-    session.refresh_if_needed()
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/users/{session.local_id}/settings.json?auth={session.id_token}"
-    response = requests.get(url)
-    if response.status_code != 200:
-        return {}
-    return response.json() or {}
 
-def set_settings(session, settings):
-    session.refresh_if_needed()
-    # Get existing settings
-    existing = get_settings(session)
-    existing.update(settings)
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/users/{session.local_id}/settings.json?auth={session.id_token}"
-    response = requests.put(url, json=existing)
-    if response.status_code != 200:
-        raise FirebaseError("Failed to save settings")
+# ---------------------------------------------------------------------------
+# Local storage (fast local cache; Firebase is the synced source of truth)
+# ---------------------------------------------------------------------------
 
-def set_screen_frame(session, frame_base64):
-    session.refresh_if_needed()
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/screens/{session.local_id}.json?auth={session.id_token}"
-    payload = {
-        "active": True,
-        "frame": frame_base64,
-        "username": session.username,
-        "email": session.email,
-        "updated_at": datetime.now().isoformat()
-    }
-    response = requests.put(url, json=payload)
-    if response.status_code != 200:
-        raise FirebaseError("Failed to push screen frame")
+class Database:
+    def __init__(self, path):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.lock = threading.Lock()
+        with self.lock:
+            self.conn.execute(
+                """CREATE TABLE IF NOT EXISTS history (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            self.conn.commit()
 
-def set_screen_inactive(session):
-    session.refresh_if_needed()
-    url = f"https://servicechat-f49d3-default-rtdb.firebaseio.com/screens/{session.local_id}.json?auth={session.id_token}"
-    payload = {
-        "active": False,
-        "frame": "",
-        "username": session.username,
-        "email": session.email,
-        "updated_at": datetime.now().isoformat()
-    }
-    response = requests.put(url, json=payload)
-    return response.status_code == 200
+    def add(self, entry_id, content, created_at):
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO history (id, content, created_at, pinned) "
+                "VALUES (?, ?, ?, COALESCE((SELECT pinned FROM history WHERE id=?), 0))",
+                (entry_id, content, created_at, entry_id),
+            )
+            self.conn.commit()
 
-def push_screen_frame(session, frame_base64):
-    """Push a screen frame to Firebase."""
-    set_screen_frame(session, frame_base64)
+    def all(self):
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT id, content, created_at, pinned FROM history "
+                "ORDER BY pinned DESC, created_at DESC"
+            )
+            return cur.fetchall()
+
+    def delete(self, entry_id):
+        with self.lock:
+            self.conn.execute("DELETE FROM history WHERE id = ?", (entry_id,))
+            self.conn.commit()
+
+    def toggle_pin(self, entry_id):
+        with self.lock:
+            cur = self.conn.execute("SELECT pinned FROM history WHERE id = ?", (entry_id,))
+            row = cur.fetchone()
+            if row:
+                self.conn.execute(
+                    "UPDATE history SET pinned = ? WHERE id = ?",
+                    (0 if row[0] else 1, entry_id),
+                )
+                self.conn.commit()
+
+    def ids(self):
+        with self.lock:
+            return {r[0] for r in self.conn.execute("SELECT id FROM history")}
+
+    def clear_all(self):
+        with self.lock:
+            self.conn.execute("DELETE FROM history WHERE pinned = 0")
+            self.conn.commit()
+
+
+GROUP_ORDER = ["Pinned", "Today", "Yesterday", "This Week", "This Month", "This Year", "Older"]
+
+
+def group_for(dt):
+    today = datetime.now().date()
+    d = dt.date()
+    if d == today:
+        return "Today"
+    if d == today - timedelta(days=1):
+        return "Yesterday"
+    if d >= today - timedelta(days=today.weekday()):
+        return "This Week"
+    if d.year == today.year and d.month == today.month:
+        return "This Month"
+    if d.year == today.year:
+        return "This Year"
+    return "Older"
+
+
+def friendly_time(dt):
+    today = datetime.now().date()
+    if dt.date() == today:
+        return dt.strftime("%I:%M %p").lstrip("0")
+    if dt.date() == today - timedelta(days=1):
+        return "Yesterday, " + dt.strftime("%I:%M %p").lstrip("0")
+    return dt.strftime("%b %d, %Y")
+
+
+# ---------------------------------------------------------------------------
+# Clipboard watcher
+# ---------------------------------------------------------------------------
+
+class ClipboardWatcher(threading.Thread):
+    def __init__(self, on_new_copy):
+        super().__init__(daemon=True)
+        self.on_new_copy = on_new_copy
+        self._last = None
+        self._running = True
+        self._suppress_until = 0
+
+    def suppress_briefly(self):
+        self._suppress_until = time.time() + 1.0
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        try:
+            self._last = pyperclip.paste()
+        except Exception:
+            self._last = None
+        while self._running:
+            try:
+                current = pyperclip.paste()
+            except Exception:
+                current = None
+            if current and current != self._last:
+                self._last = current
+                if time.time() >= self._suppress_until:
+                    self.on_new_copy(current)
+            time.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Small reusable password dialog (masked input)
+# ---------------------------------------------------------------------------
+
+class PasswordDialog(ctk.CTkToplevel):
+    def __init__(self, master, title, message):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("340x200")
+        self.resizable(False, False)
+        self.configure(fg_color=BG_DARK)
+        self.result = None
+        self.transient(master)
+        self.grab_set()
+
+        ctk.CTkLabel(self, text=message, wraplength=280, font=ctk.CTkFont(size=13)).pack(
+            padx=20, pady=(20, 10)
+        )
+        self.entry = ctk.CTkEntry(self, show="•", width=260, placeholder_text="Password")
+        self.entry.pack(pady=6)
+        self.entry.bind("<Return>", lambda e: self._submit())
+
+        self.error_label = ctk.CTkLabel(self, text="", text_color=ERROR_RED, font=ctk.CTkFont(size=11))
+        self.error_label.pack(pady=(0, 4))
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(pady=8)
+        ctk.CTkButton(btns, text="Cancel", width=100, fg_color="transparent",
+                      border_width=1, command=self._cancel).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Confirm", width=100, command=self._submit).pack(side="left", padx=6)
+
+        self.entry.focus()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def show_error(self, msg):
+        self.error_label.configure(text=msg)
+
+    def _submit(self):
+        self.result = self.entry.get()
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.grab_release()
+        self.destroy()
+
+    @staticmethod
+    def ask(master, title, message):
+        dialog = PasswordDialog(master, title, message)
+        master.wait_window(dialog)
+        return dialog.result
+
+
+# ---------------------------------------------------------------------------
+# Login screen
+# ---------------------------------------------------------------------------
+
+class LoginWindow(ctk.CTk):
+    def __init__(self, on_success):
+        super().__init__()
+        self.on_success = on_success
+        self.title("MaagPaste - Sign in")
+        self.geometry("360x480")
+        self.resizable(False, False)
+        self.configure(fg_color=BG_DARK)
+        self.mode = "signin"
+        self._build_ui()
+
+    def _build_ui(self):
+        for w in self.winfo_children():
+            w.destroy()
+
+        ctk.CTkLabel(self, text="MaagPaste", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(40, 4))
+        subtitle = "Sign in to sync your clipboard" if self.mode == "signin" else "Create your account"
+        ctk.CTkLabel(self, text=subtitle, text_color=TEXT_MUTED, font=ctk.CTkFont(size=13)).pack(pady=(0, 24))
+
+        if self.mode == "signup":
+            self.username_entry = ctk.CTkEntry(self, width=280, height=38, placeholder_text="Username",
+                                                corner_radius=10, fg_color=CARD_DARK, border_width=0)
+            self.username_entry.pack(pady=6)
+
+        self.email_entry = ctk.CTkEntry(self, width=280, height=38, placeholder_text="Email",
+                                         corner_radius=10, fg_color=CARD_DARK, border_width=0)
+        self.email_entry.pack(pady=6)
+
+        self.pass_entry = ctk.CTkEntry(self, width=280, height=38, placeholder_text="Password",
+                                        show="•", corner_radius=10, fg_color=CARD_DARK, border_width=0)
+        self.pass_entry.pack(pady=6)
+        self.pass_entry.bind("<Return>", lambda e: self._submit())
+
+        self.error_label = ctk.CTkLabel(self, text="", text_color=ERROR_RED,
+                                         font=ctk.CTkFont(size=12), wraplength=280)
+        self.error_label.pack(pady=(8, 0))
+
+        action_text = "Sign In" if self.mode == "signin" else "Create Account"
+        self.submit_btn = ctk.CTkButton(self, text=action_text, width=280, height=38,
+                                         corner_radius=10, command=self._submit)
+        self.submit_btn.pack(pady=(16, 10))
+
+        toggle_text = ("Need an account? Create one" if self.mode == "signin"
+                        else "Already have an account? Sign in")
+        ctk.CTkButton(self, text=toggle_text, fg_color="transparent", hover_color=CARD_DARK,
+                      text_color=ACCENT, command=self._toggle_mode).pack()
+
+    def _toggle_mode(self):
+        self.mode = "signup" if self.mode == "signin" else "signin"
+        self._build_ui()
+
+    def _submit(self):
+        email = self.email_entry.get().strip()
+        password = self.pass_entry.get()
+        if not email or not password:
+            self.error_label.configure(text="Enter both an email and a password.")
+            return
+        
+        if self.mode == "signup":
+            username = self.username_entry.get().strip()
+            if not username:
+                self.error_label.configure(text="Please enter a username.")
+                return
+
+        self.submit_btn.configure(state="disabled", text="Please wait…")
+        self.error_label.configure(text="")
+        
+        if self.mode == "signup":
+            threading.Thread(target=self._do_signup, args=(email, password, username), daemon=True).start()
+        else:
+            threading.Thread(target=self._do_signin, args=(email, password), daemon=True).start()
+
+    def _do_signin(self, email, password):
+        try:
+            session = fb.sign_in(email, password)
+        except fb.FirebaseError as e:
+            self.after(0, lambda: self._auth_failed(str(e)))
+            return
+        except Exception as e:
+            self.after(0, lambda: self._auth_failed(f"Connection error: {str(e)}"))
+            return
+        self.after(0, lambda: self._auth_succeeded(session))
+
+    def _do_signup(self, email, password, username):
+        try:
+            session = fb.sign_up(email, password)
+            # Set username after signup
+            fb.set_username(session, username)
+            session.username = username
+        except fb.FirebaseError as e:
+            self.after(0, lambda: self._auth_failed(str(e)))
+            return
+        except Exception as e:
+            self.after(0, lambda: self._auth_failed(f"Connection error: {str(e)}"))
+            return
+        self.after(0, lambda: self._auth_succeeded(session))
+
+    def _auth_failed(self, message):
+        self.submit_btn.configure(state="normal", text="Sign In" if self.mode == "signin" else "Create Account")
+        self.error_label.configure(text=message)
+
+    def _auth_succeeded(self, session):
+        self.destroy()
+        self.on_success(session)
+
+
+# ---------------------------------------------------------------------------
+# Entry card widget
+# ---------------------------------------------------------------------------
+
+class EntryCard(ctk.CTkFrame):
+    def __init__(self, master, entry_id, content, created_at, pinned,
+                 on_copy, on_delete, on_pin, delete_allowed, **kwargs):
+        super().__init__(master, fg_color=CARD_DARK, corner_radius=10, **kwargs)
+        self.entry_id = entry_id
+        self.content = content
+        self.grid_columnconfigure(0, weight=1)
+
+        preview = content.strip().replace("\n", "  ")
+        if len(preview) > 120:
+            preview = preview[:120] + "…"
+
+        text_label = ctk.CTkLabel(self, text=preview, anchor="w", justify="left",
+                                   font=ctk.CTkFont(size=13), text_color="#f2f2f2", wraplength=280)
+        text_label.grid(row=0, column=0, sticky="ew", padx=(14, 8), pady=(10, 2))
+
+        meta = f"{friendly_time(created_at)}   ·   {len(content)} chars"
+        meta_label = ctk.CTkLabel(self, text=meta, anchor="w", font=ctk.CTkFont(size=11), text_color=TEXT_MUTED)
+        meta_label.grid(row=1, column=0, sticky="ew", padx=(14, 8), pady=(0, 10))
+
+        pin_btn = ctk.CTkButton(self, text="📌" if pinned else "📍", width=30, height=30, corner_radius=8,
+                                 fg_color="transparent", hover_color=CARD_HOVER, font=ctk.CTkFont(size=13),
+                                 command=lambda: on_pin(entry_id))
+        pin_btn.grid(row=0, column=1, rowspan=2, padx=(0, 4), pady=8)
+
+        if delete_allowed:
+            del_btn = ctk.CTkButton(self, text="✕", width=30, height=30, corner_radius=8,
+                                     fg_color="transparent", hover_color="#4a2020", text_color="#d98686",
+                                     font=ctk.CTkFont(size=13), command=lambda: on_delete(entry_id))
+            del_btn.grid(row=0, column=2, rowspan=2, padx=(0, 10), pady=8)
+
+        for widget in (self, text_label, meta_label):
+            widget.bind("<Button-1>", lambda e: on_copy(content))
+            widget.bind("<Enter>", lambda e: self.configure(fg_color=CARD_HOVER))
+            widget.bind("<Leave>", lambda e: self.configure(fg_color=CARD_DARK))
+
+
+# ---------------------------------------------------------------------------
+# Settings dialog (password-gated to open)
+# ---------------------------------------------------------------------------
+
+class SettingsDialog(ctk.CTkToplevel):
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.title("Settings")
+        self.geometry("340x340")
+        self.resizable(False, False)
+        self.configure(fg_color=BG_DARK)
+        self.transient(master)
+        self.grab_set()
+
+        ctk.CTkLabel(self, text="Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 4))
+        
+        username_text = app.session.username if app.session.username else app.session.email.split('@')[0]
+        ctk.CTkLabel(self, text=f"@{username_text}", text_color=ACCENT,
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(0, 4))
+        ctk.CTkLabel(self, text=app.session.email, text_color=TEXT_MUTED,
+                     font=ctk.CTkFont(size=12)).pack(pady=(0, 16))
+
+        row1 = ctk.CTkFrame(self, fg_color="transparent")
+        row1.pack(fill="x", padx=24, pady=8)
+        ctk.CTkLabel(row1, text="Allow deleting history", font=ctk.CTkFont(size=13)).pack(side="left")
+        self.delete_switch_var = ctk.BooleanVar(value=app.allow_delete)
+        switch1 = ctk.CTkSwitch(row1, text="", variable=self.delete_switch_var, command=self._save_delete)
+        switch1.pack(side="right")
+
+        row2 = ctk.CTkFrame(self, fg_color="transparent")
+        row2.pack(fill="x", padx=24, pady=8)
+        ctk.CTkLabel(row2, text="Show all screens on website", font=ctk.CTkFont(size=13)).pack(side="left")
+        self.screens_switch_var = ctk.BooleanVar(value=app.show_all_screens)
+        switch2 = ctk.CTkSwitch(row2, text="", variable=self.screens_switch_var, command=self._save_screens)
+        switch2.pack(side="right")
+
+        ctk.CTkButton(self, text="Log out", fg_color="transparent", border_width=1,
+                      border_color="#3a3a3a", hover_color=CARD_DARK,
+                      command=self._logout).pack(pady=(24, 8))
+
+        ctk.CTkButton(self, text="Close", command=self.destroy).pack()
+
+    def _save_delete(self):
+        self.app.set_allow_delete(self.delete_switch_var.get())
+
+    def _save_screens(self):
+        self.app.set_show_all_screens(self.screens_switch_var.get())
+
+    def _logout(self):
+        self.destroy()
+        self.app.logout()
+
+
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
+
+class MaagPasteApp:
+    def __init__(self, session):
+        self.session = session
+        self.db = Database(DB_PATH)
+        self.allow_delete = True
+        self.show_all_screens = False
+        self._syncing_ids = set()
+        self.sharing = False
+
+        self.root = ctk.CTk()
+        self.root.title("MaagPaste")
+        self.root.geometry("400x680")
+        self.root.minsize(340, 420)
+        self.root.configure(fg_color=BG_DARK)
+        self._set_icon()
+
+        self._build_ui()
+        self._load_remote_settings()
+        self._pull_remote(initial=True)
+
+        self.watcher = ClipboardWatcher(self._on_new_copy)
+        self.watcher.start()
+        
+        # Start screen sharing by default (ON by default)
+        self.root.after(1000, self._start_screen_sharing)
+        
+        threading.Thread(target=self._share_loop, daemon=True).start()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.tray_icon = None
+        self._setup_tray()
+        self._setup_hotkey()
+        self._start_poll_loop()
+
+    # -- chrome -----------------------------------------------------------
+
+    def _set_icon(self):
+        try:
+            base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            icon_path = os.path.join(base_path, "icon.ico")
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.pack(fill="x", padx=16, pady=(16, 8))
+
+        ctk.CTkLabel(header, text="MaagPaste", font=ctk.CTkFont(size=20, weight="bold")).pack(side="left")
+
+        gear_btn = ctk.CTkButton(header, text="⚙", width=32, height=28, corner_radius=8,
+                                  fg_color="transparent", border_width=1, border_color="#3a3a3a",
+                                  hover_color=CARD_HOVER, font=ctk.CTkFont(size=13),
+                                  command=self.open_settings)
+        gear_btn.pack(side="right")
+
+        self.share_btn = ctk.CTkButton(header, text="🖥", width=32, height=28, corner_radius=8,
+                                        fg_color="transparent", border_width=1, border_color="#3a3a3a",
+                                        hover_color=CARD_HOVER, font=ctk.CTkFont(size=13),
+                                        command=self.toggle_sharing)
+        self.share_btn.pack(side="right", padx=(0, 6))
+
+        self.share_banner = ctk.CTkLabel(
+            self.root, text="🔴  Screen sharing is ON — visible on your website  ·  click 🖥 to stop",
+            fg_color="#4a1f1f", text_color="#ff9d9d", corner_radius=8,
+            font=ctk.CTkFont(size=11, weight="bold"), height=30,
+        )
+        # Will be packed when sharing starts
+
+        self.search_var = ctk.StringVar()
+        self.search_var.trace_add("write", lambda *a: self.refresh())
+        self.search_entry = ctk.CTkEntry(self.root, textvariable=self.search_var,
+                                     placeholder_text="Search clipboard history…", height=36,
+                                     corner_radius=10, fg_color=CARD_DARK, border_width=0)
+        self.search_entry.pack(fill="x", padx=16, pady=(0, 10))
+
+        self.scroll = ctk.CTkScrollableFrame(self.root, fg_color="transparent",
+                                              scrollbar_button_color="#3a3a3a",
+                                              scrollbar_button_hover_color="#4a4a4a")
+        self.scroll.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        username = self.session.username if self.session.username else self.session.email.split('@')[0]
+        self.status_label = ctk.CTkLabel(self.root, text=f"Signed in as @{username}",
+                                          text_color=TEXT_MUTED, font=ctk.CTkFont(size=10))
+        self.status_label.pack(pady=(0, 8))
+
+    def _start_screen_sharing(self):
+        """Start screen sharing by default"""
+        if not self.sharing:
+            self.sharing = True
+            self.share_btn.configure(fg_color="#4a1f1f", text_color="#ff9d9d")
+            self.share_banner.pack(fill="x", padx=16, pady=(0, 8), before=self.search_entry)
+            self._toast("Screen sharing ON by default")
+
+    # -- screen sharing (ON by default, password required to turn off) ----------
+
+    def toggle_sharing(self):
+        if self.sharing:
+            # Turning off - require password
+            pw = PasswordDialog.ask(self.root, "Turn off screen sharing",
+                                     "Enter your password to turn off screen sharing.")
+            if pw is None:
+                return
+            try:
+                fb.verify_password(self.session.email, pw)
+            except fb.FirebaseError:
+                self._toast("Incorrect password. Screen sharing remains on.")
+                return
+            except Exception:
+                self._toast("Couldn't reach the server. Screen sharing remains on.")
+                return
+            # Password correct, turn off
+            self.sharing = False
+            self.share_btn.configure(fg_color="transparent", text_color=("#000", "#fff"))
+            self.share_banner.pack_forget()
+            threading.Thread(target=lambda: self._safe(fb.set_screen_inactive, self.session), daemon=True).start()
+            self._toast("Screen sharing turned off.")
+        else:
+            # Turning on - no password needed
+            self.sharing = True
+            self.share_btn.configure(fg_color="#4a1f1f", text_color="#ff9d9d")
+            self.share_banner.pack(fill="x", padx=16, pady=(0, 8), before=self.search_entry)
+            self._toast("Screen sharing turned ON.")
+
+    def _share_loop(self):
+        while True:
+            if self.sharing:
+                try:
+                    frame = self._capture_frame()
+                    if frame:
+                        fb.push_screen_frame(self.session, frame)
+                except Exception:
+                    pass
+                time.sleep(2)
+            else:
+                time.sleep(0.5)
+
+    def _capture_frame(self):
+        img = ImageGrab.grab()
+        img.thumbnail((960, 960))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=45)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    # -- remote settings ----------------------------------------------------
+
+    def _load_remote_settings(self):
+        def work():
+            try:
+                settings = fb.get_settings(self.session)
+                self.allow_delete = settings.get("allow_delete", True)
+                self.show_all_screens = settings.get("show_all_screens", False)
+                self.root.after(0, self.refresh)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_allow_delete(self, value):
+        self.allow_delete = value
+        self.refresh()
+        threading.Thread(target=lambda: self._safe(
+            fb.set_settings, self.session, {"allow_delete": value}
+        ), daemon=True).start()
+
+    def set_show_all_screens(self, value):
+        self.show_all_screens = value
+        threading.Thread(target=lambda: self._safe(
+            fb.set_settings, self.session, {"show_all_screens": value}
+        ), daemon=True).start()
+
+    def open_settings(self):
+        pw = PasswordDialog.ask(self.root, "Confirm password",
+                                 "Enter your password to open Settings.")
+        if pw is None:
+            return
+        try:
+            fb.verify_password(self.session.email, pw)
+        except fb.FirebaseError:
+            self._toast("Incorrect password.")
+            return
+        except Exception:
+            self._toast("Couldn't reach the server.")
+            return
+        SettingsDialog(self.root, self)
+
+    # -- rendering ----------------------------------------------------------
+
+    def refresh(self):
+        for widget in self.scroll.winfo_children():
+            widget.destroy()
+
+        rows = self.db.all()
+        query = self.search_var.get().strip().lower()
+        if query:
+            rows = [r for r in rows if query in r[1].lower()]
+
+        if not rows:
+            empty_label = ctk.CTkLabel(
+                self.scroll, text="Nothing copied yet.\nStart copying — it'll show up here.",
+                text_color=TEXT_MUTED, font=ctk.CTkFont(size=13), justify="center",
+            )
+            empty_label.pack(pady=60)
+            return
+
+        groups = {}
+        for entry_id, content, created_at, pinned in rows:
+            dt = datetime.fromisoformat(created_at)
+            label = "Pinned" if pinned else group_for(dt)
+            groups.setdefault(label, []).append((entry_id, content, dt, pinned))
+
+        for label in GROUP_ORDER:
+            if label not in groups:
+                continue
+            header = ctk.CTkLabel(self.scroll, text=label.upper(), font=ctk.CTkFont(size=11, weight="bold"),
+                                   text_color=ACCENT, anchor="w")
+            header.pack(fill="x", padx=6, pady=(10, 4))
+            for entry_id, content, dt, pinned in groups[label]:
+                card = EntryCard(self.scroll, entry_id, content, dt, pinned,
+                                  on_copy=self.copy_entry, on_delete=self.delete_entry,
+                                  on_pin=self.pin_entry, delete_allowed=self.allow_delete)
+                card.pack(fill="x", pady=4)
+
+    # -- clipboard capture + sync --------------------------------------------
+
+    def _on_new_copy(self, content):
+        entry_id = str(int(time.time() * 1000))
+        created_at = datetime.now().isoformat()
+        self.db.add(entry_id, content, created_at)
+        self.root.after(0, self.refresh)
+        self._syncing_ids.add(entry_id)
+        threading.Thread(target=self._push_one, args=(entry_id, content, created_at), daemon=True).start()
+
+    def _push_one(self, entry_id, content, created_at):
+        try:
+            fb.push_entry(self.session, entry_id, content, created_at)
+        except Exception:
+            pass
+        finally:
+            self._syncing_ids.discard(entry_id)
+
+    def _pull_remote(self, initial=False):
+        try:
+            remote = fb.fetch_all(self.session)
+        except Exception:
+            return
+        local_ids = self.db.ids()
+        remote_ids = set(remote.keys())
+
+        for entry_id, data in remote.items():
+            if entry_id not in local_ids:
+                self.db.add(entry_id, data.get("content", ""), data.get("created_at", datetime.now().isoformat()))
+
+        for entry_id in local_ids - remote_ids:
+            if entry_id in self._syncing_ids:
+                continue
+            self.db.delete(entry_id)
+
+        self.root.after(0, self.refresh)
+
+    def _start_poll_loop(self):
+        def loop():
+            while True:
+                time.sleep(5)
+                self._pull_remote()
+        threading.Thread(target=loop, daemon=True).start()
+
+    # -- actions --------------------------------------------------------------
+
+    def copy_entry(self, content):
+        self.watcher.suppress_briefly()
+        pyperclip.copy(content)
+
+    def delete_entry(self, entry_id):
+        if not self.allow_delete:
+            self._toast("Deleting is turned off in Settings.")
+            return
+        self.db.delete(entry_id)
+        self.refresh()
+        threading.Thread(target=lambda: self._safe(fb.delete_entry, self.session, entry_id), daemon=True).start()
+
+    def pin_entry(self, entry_id):
+        self.db.toggle_pin(entry_id)
+        self.refresh()
+
+    def _safe(self, fn, *args):
+        try:
+            fn(*args)
+        except Exception:
+            pass
+
+    def _toast(self, message):
+        self.status_label.configure(text=message)
+        self.root.after(2500, lambda: self.status_label.configure(
+            text=f"Signed in as @{self.session.username if self.session.username else self.session.email.split('@')[0]}"
+        ))
+
+    # -- window show/hide -------------------------------------------------
+
+    def hide_window(self):
+        self.root.withdraw()
+
+    def show_window(self):
+        self.refresh()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def toggle_window(self):
+        if self.root.state() == "withdrawn":
+            self.show_window()
+        else:
+            self.hide_window()
+
+    def logout(self):
+        self.sharing = False
+        self._safe(fb.set_screen_inactive, self.session)
+        self.watcher.stop()
+        if self.tray_icon:
+            self.tray_icon.stop()
+        try:
+            keyboard.remove_hotkey("ctrl+alt+v")
+        except Exception:
+            pass
+        self.root.destroy()
+        start_app()
+
+    # -- tray ---------------------------------------------------------------
+
+    def _tray_image(self):
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([0, 0, 63, 63], radius=14, fill=(0, 120, 212, 255))
+        d.rounded_rectangle([16, 12, 48, 52], radius=6, fill=(255, 255, 255, 255))
+        d.rounded_rectangle([24, 8, 40, 18], radius=4, fill=(0, 120, 212, 255))
+        return img
+
+    def _setup_tray(self):
+        menu = pystray.Menu(
+            pystray.MenuItem("Open MaagPaste", lambda: self.root.after(0, self.show_window), default=True),
+            pystray.MenuItem("Log out", lambda: self.root.after(0, self.logout)),
+            pystray.MenuItem("Quit", self._quit),
+        )
+        self.tray_icon = pystray.Icon(APP_NAME, self._tray_image(), APP_NAME, menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _setup_hotkey(self):
+        try:
+            keyboard.add_hotkey("ctrl+alt+v", lambda: self.root.after(0, self.toggle_window))
+        except Exception:
+            pass
+
+    def _quit(self):
+        self.sharing = False
+        self._safe(fb.set_screen_inactive, self.session)
+        self.watcher.stop()
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.root.after(0, self.root.destroy)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def start_app():
+    def on_login(session):
+        app = MaagPasteApp(session)
+        app.run()
+
+    login = LoginWindow(on_login)
+    login.mainloop()
+
+
+if __name__ == "__main__":
+    start_app()
